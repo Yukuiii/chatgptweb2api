@@ -283,7 +283,21 @@ def _xor_string(text: str, key: str) -> str:
     return "".join(chr(ord(ch) ^ ord(key[i % len(key)])) for i, ch in enumerate(text))
 
 
-def _solve_turnstile(dx: str, key: str) -> Optional[str]:
+def _solve_turnstile(
+    dx: str,
+    key: str,
+    script_sources: Optional[list] = None,
+) -> Optional[str]:
+    """turnstile token 求解器 —— 完整对齐 sdk.js 的 Et/Pn 字节码解释器(opcode 0-35)。
+
+    流程:dx → base64 → XOR(key) → JSON.parse 得指令队列 → 队列驱动解释器执行。
+    浏览器对象(window/document/Math/Reflect/...)用"路径字符串 + special 映射 + 调用 dispatch"模拟,
+    因为 Python 侧无真实 DOM。opcode 语义逐条对照 reference/sentinel_sdk.js 的 Et 函数(657-815 行)。
+
+    XOR key = p token(requirements token)。已实测验证:
+    真实 SDK 中 Pn(dx, req) 用 key = $(requirements) 做 XOR(见 sentinel_sdk.js:1015/1161),
+    而 $(requirements) 的序列化结果就等于我们的 p token,故直接复用 p_token 一致。
+    """
     try:
         decoded = base64.b64decode(dx).decode()
         token_list = json.loads(_xor_string(decoded, key))
@@ -292,102 +306,312 @@ def _solve_turnstile(dx: str, key: str) -> Optional[str]:
 
     pm: Dict[Any, Any] = {}
     start_time = time.time()
-    result = ""
+    box = {"result": None, "done": False}  # H(3) 成功 / V(4) 失败 写入
 
-    def f1(e, t): pm[e] = _xor_string(_turnstile_to_str(pm[e]), _turnstile_to_str(pm[t]))
+    _LOCALSTORAGE_KEYS = [
+        "STATSIG_LOCAL_STORAGE_INTERNAL_STORE_V4",
+        "STATSIG_LOCAL_STORAGE_STABLE_ID",
+        "client-correlated-secret",
+        "oai/apps/capExpiresAt",
+        "oai-did",
+        "STATSIG_LOCAL_STORAGE_LOGGING_REQUEST",
+        "UiState.isNavigationCollapsed.1",
+    ]
 
-    def f2(e, t): pm[e] = t
+    def _to_str(v: Any) -> str:
+        return _turnstile_to_str(v)
 
-    def f3(e):
-        nonlocal result
-        result = base64.b64encode(e.encode()).decode()
+    def _to_num(v: Any) -> float:
+        if isinstance(v, bool):
+            return 1.0 if v else 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float("nan")
 
-    def f5(e, t):
-        cur, inc = pm[e], pm[t]
-        if isinstance(cur, (list, tuple)):
-            pm[e] = list(cur) + [inc]; return
-        if isinstance(cur, (str, float)) or isinstance(inc, (str, float)):
-            pm[e] = _turnstile_to_str(cur) + _turnstile_to_str(inc); return
-        pm[e] = "NaN"
+    def _js_add(a: Any, b: Any) -> Any:
+        """JS 的 +:两侧均数字(且非 bool)则加法,否则字符串拼接"""
+        if isinstance(a, bool) or isinstance(b, bool):
+            return _to_str(a) + _to_str(b)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            return a + b
+        return _to_str(a) + _to_str(b)
 
-    def f6(e, t, n):
-        tv, nv = pm[t], pm[n]
-        if isinstance(tv, str) and isinstance(nv, str):
-            v = f"{tv}.{nv}"
-            pm[e] = "https://chatgpt.com/" if v == "window.document.location" else v
+    def _prop(obj: Any, k: Any) -> Any:
+        """K/Q 的 obj[key]:字符串走路径拼接(window/document 等),容器走真实取值"""
+        if obj is None:
+            return None
+        ks = _to_str(k)
+        if isinstance(obj, str):
+            joined = f"{obj}.{ks}"
+            return "https://chatgpt.com/" if joined == "window.document.location" else joined
+        if isinstance(obj, _OrderedMap):
+            return obj.values.get(ks)
+        if isinstance(obj, dict):
+            return obj.get(ks)
+        if isinstance(obj, list):
+            try:
+                return obj[int(k)]
+            except (ValueError, IndexError):
+                return None
+        return f"{_to_str(obj)}.{ks}"
 
-    def f7(e, *args):
-        target = pm[e]
-        vals = [pm[a] for a in args]
-        if isinstance(target, str) and target == "window.Reflect.set":
-            obj, k, v = vals
-            obj.add(str(k), v)
-        elif callable(target):
-            target(*vals)
+    def _call(target: Any, args: list) -> Any:
+        """Y/ut/ot 的调用 dispatch:对 window.* 路径 special-case,否则 callable"""
+        if isinstance(target, str):
+            if target == "window.Math.random":
+                return random.random()
+            if target == "window.performance.now":
+                return (time.time_ns() - int(start_time * 1e9) + random.random()) / 1e6
+            if target == "window.Object.create":
+                return _OrderedMap()
+            if target == "window.Object.keys":
+                a = args[0] if args else None
+                if _to_str(a) == "window.localStorage":
+                    return list(_LOCALSTORAGE_KEYS)
+                if isinstance(a, _OrderedMap):
+                    return list(a.keys)
+                if isinstance(a, dict):
+                    return list(a.keys())
+                if isinstance(a, list):
+                    return [str(i) for i in range(len(a))]
+                return []
+            if target == "window.Reflect.set":
+                obj, kk, vv = (args + [None, None, None])[:3]
+                if isinstance(obj, _OrderedMap):
+                    obj.add(_to_str(kk), vv)
+                return None
+            if target == "window.btoa":
+                return base64.b64encode(_to_str(args[0] if args else "").encode()).decode()
+            if target == "window.atob":
+                try:
+                    return base64.b64decode(_to_str(args[0] if args else "")).decode()
+                except Exception:
+                    return ""
+            if target == "window.JSON.stringify":
+                try:
+                    return json.dumps(args[0] if args else None)
+                except Exception:
+                    return "null"
+            if target == "window.JSON.parse":
+                try:
+                    return json.loads(_to_str(args[0] if args else "null"))
+                except Exception:
+                    return None
+            return None  # 其它未知 window 方法 → undefined
+        if callable(target):
+            try:
+                return target(*args)
+            except Exception:
+                return None
+        return None
 
-    def f8(e, t): pm[e] = pm[t]
+    # ---- opcode 处理函数(逐条对齐 sdk.js Et)----
+    def op0(*args):  # W(664): 递归求解子 dx,复用当前 key
+        sub = args[0] if args else None
+        if isinstance(sub, str) and sub:
+            saved = pm.get(9)
+            try:
+                pm[9] = json.loads(_xor_string(base64.b64decode(sub).decode(), key))
+                _run()
+            except Exception:
+                pass
+            finally:
+                pm[9] = saved
 
-    def f14(e, t): pm[e] = json.loads(pm[t])
+    def op1(n, e):  # z(665): XOR 两寄存器
+        pm[n] = _xor_string(_to_str(pm.get(n)), _to_str(pm.get(e)))
 
-    def f15(e, t): pm[e] = json.dumps(pm[t])
+    def op2(t, n):  # B(666): set 字面量(n 是值本身)
+        pm[t] = n
 
-    def f17(e, t, *args):
-        ca = [pm[a] for a in args]
-        target = pm[t]
-        if target == "window.performance.now":
-            pm[e] = (time.time_ns() - int(start_time * 1e9) + random.random()) / 1e6
-        elif target == "window.Object.create":
-            pm[e] = _OrderedMap()
-        elif target == "window.Object.keys":
-            if ca and ca[0] == "window.localStorage":
-                pm[e] = [
-                    "STATSIG_LOCAL_STORAGE_INTERNAL_STORE_V4",
-                    "STATSIG_LOCAL_STORAGE_STABLE_ID",
-                    "client-correlated-secret",
-                    "oai/apps/capExpiresAt",
-                    "oai-did",
-                    "STATSIG_LOCAL_STORAGE_LOGGING_REQUEST",
-                    "UiState.isNavigationCollapsed.1",
-                ]
-        elif target == "window.Math.random":
-            pm[e] = random.random()
-        elif callable(target):
-            pm[e] = target(*ca)
+    def op3(t):  # H(774): 成功 → btoa(t)
+        if not box["done"]:
+            box["done"] = True
+            box["result"] = base64.b64encode(_to_str(t).encode()).decode()
 
-    def f18(e): pm[e] = base64.b64decode(_turnstile_to_str(pm[e])).decode()
+    def op4(t):  # V(777): 失败 → btoa(t)
+        if not box["done"]:
+            box["done"] = True
+            box["result"] = base64.b64encode(_to_str(t).encode()).decode()
 
-    def f19(e): pm[e] = base64.b64encode(_turnstile_to_str(pm[e]).encode()).decode()
+    def op5(n, e):  # Z(667): 数组 push / JS +
+        cur = pm.get(n)
+        if isinstance(cur, list):
+            cur.append(pm.get(e))
+        else:
+            pm[n] = _js_add(cur, pm.get(e))
 
-    def f20(e, t, n, *args):
-        if pm[e] == pm[t]:
-            target = pm[n]
-            if callable(target):
-                target(*[pm[a] for a in args])
+    def op6(n, e, r):  # K(690): obj[key]
+        pm[n] = _prop(pm.get(e), pm.get(r))
 
-    def f21(*_): return
+    def op7(n, *e):  # Y(691): 调用 pm[n](pm[e_i]...)
+        _call(pm.get(n), [pm.get(x) for x in e])
 
-    def f23(e, t, *args):
-        if pm[e] is not None and callable(pm[t]):
-            pm[t](*args)
+    def op8(n, e):  # X(715): copy
+        pm[n] = pm.get(e)
 
-    def f24(e, t, n):
-        tv, nv = pm[t], pm[n]
-        if isinstance(tv, str) and isinstance(nv, str):
-            pm[e] = f"{tv}.{nv}"
+    def op11(n, e):  # et(717): document.scripts 正则匹配取第一个 src
+        pattern = _to_str(pm.get(e))
+        found = None
+        try:
+            rx = re.compile(pattern)
+        except re.error:
+            rx = None
+        for src in (script_sources or []):
+            if rx and rx.search(src):
+                found = src
+                break
+        pm[n] = found
 
+    def op12(n):  # rt(725): 解释器自身
+        pm[n] = pm
+
+    def op13(n, e, *r):  # ot(707): try call(sdk 原样传 r,不 map 取值)
+        try:
+            _call(pm.get(e), list(r))
+        except Exception:
+            pm[n] = "error"
+
+    def op14(n, e):  # ct(726): JSON.parse
+        pm[n] = json.loads(_to_str(pm.get(e)))
+
+    def op15(n, e):  # it(727): JSON.stringify(JS 语义:整数 float 去小数)
+        v = pm.get(e)
+        if isinstance(v, float) and v.is_integer():
+            v = int(v)
+        pm[n] = json.dumps(v)
+
+    def op17(n, e, *r):  # ut(692): async try call,结果存 pm[n]
+        try:
+            pm[n] = _call(pm.get(e), [pm.get(x) for x in r])
+        except Exception as ex:
+            pm[n] = str(ex)
+
+    def op18(n):  # at(728): atob
+        pm[n] = base64.b64decode(_to_str(pm.get(n))).decode()
+
+    def op19(n):  # ft(729): btoa
+        pm[n] = base64.b64encode(_to_str(pm.get(n)).encode()).decode()
+
+    def op20(n, e, r, *o):  # dt(730): pm[n]===pm[e] 则调 pm[r]
+        if pm.get(n) == pm.get(e):
+            _call(pm.get(r), [pm.get(x) for x in o])
+
+    def op21(n, e, r, o, *c):  # ht(731): abs(pm[n]-pm[e])>pm[r] 则调 pm[o]
+        if abs(_to_num(pm.get(n)) - _to_num(pm.get(e))) > _to_num(pm.get(r)):
+            _call(pm.get(o), [pm.get(x) for x in c])
+
+    def op22(n, e):  # pt(747): 嵌套子队列执行
+        saved = pm.get(9)
+        pm[9] = list(e) if isinstance(e, list) else []
+        try:
+            _run()
+        except Exception:
+            pass
+        pm[n] = _to_str(box["result"])
+        pm[9] = saved
+
+    def op23(n, e, *r):  # lt(734): pm[n] !== undefined 则调 pm[e]
+        if pm.get(n) is not None:
+            _call(pm.get(e), list(r))
+
+    def op24(n, e, r):  # Q(735): obj[key].bind(obj) —— 路径模拟同 K
+        pm[n] = _prop(pm.get(e), pm.get(r))
+
+    def op25(*a):  # mt(763): noop
+        pass
+
+    def op26(*a):  # wt(762): noop
+        pass
+
+    def op27(n, e):  # yt(672): 数组移除 / 数值减
+        cur = pm.get(n)
+        if isinstance(cur, list):
+            try:
+                cur.remove(pm.get(e))
+            except ValueError:
+                pass
+        else:
+            pm[n] = _to_num(cur) - _to_num(pm.get(e))
+
+    def op28(*a):  # gt(761): noop
+        pass
+
+    def op29(n, e, r):  # vt(677): 小于
+        pm[n] = pm.get(e) < pm.get(r)
+
+    def op30(t, n, e, r):  # bt(782): 创建闭包存 pm[t],调用时执行子队列返回 pm[n]
+        is_arr = isinstance(r, list)
+        params = (e if is_arr else []) or []
+        body = (r if is_arr else e) or []
+
+        def _closure(*args):
+            saved = pm.get(9)
+            if is_arr:
+                for idx, reg in enumerate(params):
+                    if idx < len(args):
+                        pm[reg] = args[idx]
+            pm[9] = list(body)
+            try:
+                _run()
+            except Exception:
+                pass
+            res = pm.get(n)
+            pm[9] = saved
+            return res
+
+        pm[t] = _closure
+
+    def op33(n, e, r):  # kt(678): 乘法
+        pm[n] = _to_num(pm.get(e)) * _to_num(pm.get(r))
+
+    def op34(n, e):  # Ct(736): Promise.resolve(同步近似)
+        pm[n] = pm.get(e)
+
+    def op35(n, e, r):  # St(684): 除法(除 0 → 0)
+        d = _to_num(pm.get(r))
+        pm[n] = 0.0 if d == 0 else _to_num(pm.get(e)) / d
+
+    # 数据寄存器:tt(9)=指令队列 / nt(10)=window / st(16)=XOR key;其余为 opcode 处理函数
+    pm[9] = token_list
+    pm[10] = "window"
+    pm[16] = key
     pm.update({
-        1: f1, 2: f2, 3: f3, 5: f5, 6: f6, 7: f7, 8: f8, 9: token_list, 10: "window",
-        14: f14, 15: f15, 16: key, 17: f17, 18: f18, 19: f19, 20: f20, 21: f21, 23: f23, 24: f24,
+        0: op0, 1: op1, 2: op2, 3: op3, 4: op4, 5: op5, 6: op6, 7: op7, 8: op8,
+        11: op11, 12: op12, 13: op13, 14: op14, 15: op15, 17: op17, 18: op18,
+        19: op19, 20: op20, 21: op21, 22: op22, 23: op23, 24: op24,
+        25: op25, 26: op26, 27: op27, 28: op28, 29: op29, 30: op30,
+        33: op33, 34: op34, 35: op35,
     })
 
-    for token in token_list:
-        try:
-            fn = pm.get(token[0])
+    def _run():
+        """Pt():队列驱动执行,直到队列空或 H/V 置 done"""
+        while not box["done"]:
+            queue = pm.get(9)
+            if not isinstance(queue, list) or not queue:
+                break
+            instr = queue.pop(0)
+            if not isinstance(instr, (list, tuple)) or not instr:
+                continue
+            op = instr[0]
+            # op 可以是整数(固定 opcode 0-35)或浮点(动态寄存器,存之前 X 复制进去的函数)。
+            # 例:[8,19.26,8] 把 X 函数存到 pm[19.26];后续 [19.26,...] 的 op=19.26 引用它。
+            fn = pm.get(op)
             if callable(fn):
-                fn(*token[1:])
-        except Exception:
-            continue
-    return result or None
+                try:
+                    fn(*instr[1:])
+                except Exception:
+                    continue
+
+    try:
+        _run()
+    except Exception:
+        pass
+
+    return box["result"]
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +722,7 @@ class SentinelToken:
 def _sentinel(
     session: requests.Session,
     script_source: Optional[str],
+    script_sources: Optional[list] = None,
 ) -> SentinelToken:
     config = _build_pow_config(USER_AGENT, script_source, CLIENT_VERSION)
     p_token = _build_requirements_token(config)
@@ -529,7 +754,7 @@ def _sentinel(
     turnstile_token = ""
     ts_info = data.get("turnstile") or {}
     if ts_info.get("required") and ts_info.get("dx"):
-        turnstile_token = _solve_turnstile(ts_info["dx"], p_token) or ""
+        turnstile_token = _solve_turnstile(ts_info["dx"], p_token, script_sources=script_sources) or ""
 
     # finalize 字段名是 proofofwork / turnstile(抓包确认,非 proof_token / turnstile_token)
     path = "/backend-anon/sentinel/chat-requirements/finalize"
@@ -777,7 +1002,7 @@ def get_sentinel_token(session: Optional[requests.Session] = None) -> SentinelTo
     sess = session or _build_session()
     try:
         sources, _ = _bootstrap(sess)
-        return _sentinel(sess, random.choice(sources))
+        return _sentinel(sess, random.choice(sources), script_sources=sources)
     finally:
         if own:
             sess.close()
@@ -789,7 +1014,7 @@ def ask(prompt: str, model: str = "auto") -> str:
     try:
         sources, _ = _bootstrap(session)
         script_source = random.choice(sources)
-        sentinel = _sentinel(session, script_source)
+        sentinel = _sentinel(session, script_source, script_sources=sources)
         conduit = _prepare_conversation(session, model)
         messages = [_build_message(prompt)]
         chunks = []
@@ -824,7 +1049,7 @@ def chat(model: str = "auto") -> None:
         history.append(_build_message(user_input))
 
         try:
-            sentinel = _sentinel(session, random.choice(sources))
+            sentinel = _sentinel(session, random.choice(sources), script_sources=sources)
         except Exception as e:
             print(f"[sentinel error] {e}")
             break
