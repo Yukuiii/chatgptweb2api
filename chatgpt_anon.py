@@ -1,18 +1,18 @@
 """
 chatgpt_anon.py — ChatGPT 匿名(unauth)模式客户端
 
-对齐 chatgpt.com 真实前端抓包链路(backend-anon)。相对通用实现的关键修正:
+对齐 chatgpt.com 真实前端抓包链路(backend-anon)。实现要点:
 
-  1. PoW 算法: FNV-1a + murmur3 fmix32(32-bit hex),而非 sha3_512
+  1. PoW 算法: FNV-1a + murmur3 fmix32(32-bit hex)
      - answer = base64(JSON.stringify(config)) + "~S"
-     - config[3] = nonce, config[9] = 经过毫秒数(非 nonce>>1)
+     - config[3] = nonce, config[9] = 经过毫秒数
      - difficulty 是 hex 字符串前缀字典序比较
-  2. finalize 字段名: proofofwork / turnstile(非 proof_token / turnstile_token)
+  2. finalize 字段名: proofofwork / turnstile
   3. 域名: backend-anon
   4. client 版本: prod-5e453451adb2de3afe642039d5230eb40e1f57b9 / build 7436895
   5. device-id 与 cookie oai-did 绑定,会话内稳定(指纹自洽)
-  6. conversation: 去掉 partial_query,加 x-oai-turn-trace-id / no_auth_ad_preferences
-     流请求的 x-openai-target-path 用 /backend-api/f/conversation(与 URL 的 backend-anon 不同,真实如此)
+  6. conversation: 带 x-oai-turn-trace-id / no_auth_ad_preferences;
+     流请求的 x-openai-target-path 用 /backend-api/f/conversation(URL 仍是 backend-anon)
 
 真实链路:
   POST /backend-anon/sentinel/chat-requirements/prepare   {p}
@@ -24,9 +24,10 @@ chatgpt_anon.py — ChatGPT 匿名(unauth)模式客户端
 
 依赖: pip install curl_cffi
 用法:
-  python chatgpt_anon.py
-  python chatgpt_anon.py --token-only
-  python chatgpt_anon.py --model auto
+  python chatgpt_anon.py                      # 交互式多轮对话
+  python chatgpt_anon.py --token-only         # 只获取并打印 sentinel token
+  python chatgpt_anon.py --ask "你好"          # 单轮问答,打印完整回复后退出
+  python chatgpt_anon.py --model gpt-4o-mini  # 指定模型 slug(默认 auto)
 """
 
 import argparse
@@ -78,7 +79,7 @@ def _utf8_b64(s: str) -> str:
 
 # ---------------------------------------------------------------------------
 # PoW 哈希: FNV-1a + murmur3 fmix32(对应 sdk.js 的 hash 函数)
-# 输出 8 位 hex,32-bit。注意:不是 sha3_512。
+# 输出 8 位 hex,32-bit。
 # ---------------------------------------------------------------------------
 
 def _fnv1a_fmix32(text: str) -> str:
@@ -756,7 +757,7 @@ def _sentinel(
     if ts_info.get("required") and ts_info.get("dx"):
         turnstile_token = _solve_turnstile(ts_info["dx"], p_token, script_sources=script_sources) or ""
 
-    # finalize 字段名是 proofofwork / turnstile(抓包确认,非 proof_token / turnstile_token)
+    # finalize 字段名是 proofofwork / turnstile(抓包确认)
     path = "/backend-anon/sentinel/chat-requirements/finalize"
     resp = session.post(
         ANON_API + "/sentinel/chat-requirements/finalize",
